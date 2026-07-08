@@ -1,0 +1,9 @@
+db-sqlite3
+datetime
+cdifflib
+PyQt6
+torch
+torchaudio
+demucs
+whisperx
+soundfile

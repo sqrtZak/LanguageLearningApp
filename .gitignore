@@ -1,0 +1,6 @@
+.venv/
+Assets/
+main.py
+main[0-9]*.py
+learning_data.db
+temp_vocals.wav

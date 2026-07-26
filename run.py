@@ -22,12 +22,21 @@ import genanki
 # ==========================================
 # 1. Top-Level Parallel Worker Function (Robust Global Alignment)
 # ==========================================
+# ==========================================
+# 1. Top-Level Parallel Worker Function (Robust Global Alignment)
+# ==========================================
 def process_single_song(task):
     import torch
     import torchaudio
     from demucs.pretrained import get_model
     from demucs.apply import apply_model
     import whisperx
+    import os
+    import uuid
+    import string
+    import subprocess
+    import tempfile
+    from difflib import SequenceMatcher
 
     audio_path = task['audio']
     lyrics_path = task['lyrics']
@@ -35,9 +44,27 @@ def process_single_song(task):
     
     device = "cpu"
     compute_type = "int8"
+    
+    # Initialize temp paths so we can guarantee cleanup
     vocals_path = None
+    stripped_wav_path = None
     
     try:
+        # --- THE FIX: Strip the audio into a "regular" WAV file ---
+        temp_dir = tempfile.gettempdir()
+        stripped_wav_path = os.path.join(temp_dir, f"stripped_audio_{uuid.uuid4().hex}.wav")
+        vocals_path = os.path.join(temp_dir, f"temp_vocals_{uuid.uuid4().hex}.wav")
+
+        # FFmpeg reads the MP3, strips all ID3 tags/album art, and outputs a raw WAV
+        subprocess.run([
+            "ffmpeg", "-y", "-i", audio_path,
+            "-vn",          # Strip any video/album art
+            "-ar", "44100", # Standardize sample rate
+            "-ac", "2",     # Standardize to stereo
+            stripped_wav_path
+        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+
+        # Load isolation and transcription models
         demucs_model = get_model("htdemucs")
         demucs_model.to(device)
         demucs_model.eval()
@@ -45,7 +72,9 @@ def process_single_song(task):
         whisper_model = whisperx.load_model("large-v2", device, compute_type=compute_type)
         align_model, align_metadata = whisperx.load_align_model(language_code="ru", device=device)
         
-        wav, sr = torchaudio.load(audio_path)
+        # Audio preprocessing (Load the stripped WAV, not the original MP3)
+        wav, sr = torchaudio.load(stripped_wav_path)
+        
         if sr != demucs_model.samplerate:
             resampler = torchaudio.transforms.Resample(orig_freq=sr, new_freq=demucs_model.samplerate)
             wav = resampler(wav)
@@ -58,9 +87,9 @@ def process_single_song(task):
         vocals_idx = demucs_model.sources.index("vocals")
         vocals_tensor = sources[vocals_idx].cpu()
         
-        vocals_path = f"temp_vocals_{uuid.uuid4().hex}.wav"
         torchaudio.save(vocals_path, vocals_tensor, sr)
         
+        # Audio Transcription & Word-Level Alignment
         audio = whisperx.load_audio(vocals_path)
         transcribe_result = whisper_model.transcribe(audio, batch_size=8, language="ru")
         
@@ -68,15 +97,14 @@ def process_single_song(task):
             transcribe_result["segments"], align_model, align_metadata, audio, device, return_char_alignments=False
         )
 
-        if os.path.exists(vocals_path):
-            os.remove(vocals_path)
-
+        # Parse Reference Lyrics File
         with open(lyrics_path, 'r', encoding='utf-8') as f:
             raw_lines = [line.strip() for line in f.readlines() if line.strip()]
 
         user_ru = raw_lines[0::2]
         user_en = raw_lines[1::2]
 
+        # Flatten Reference Lyrics for Structural Mapping
         user_words = []
         word_to_line_map = []
         for line_idx, ru_line in enumerate(user_ru):
@@ -88,6 +116,7 @@ def process_single_song(task):
         if not user_words:
             return {"success": False, "title": title, "error": "Reference lyrics file is empty."}
 
+        # Flatten Model Transcribed Words
         whisper_word_objects = []
         whisper_clean_words = []
         for segment in aligned_result["segments"]:
@@ -101,6 +130,7 @@ def process_single_song(task):
 
         total_duration = whisper_word_objects[-1]["end"] if whisper_word_objects else 180.0
 
+        # Global Structural Matching Block Detection
         matcher = SequenceMatcher(None, whisper_clean_words, user_words)
         matching_blocks = matcher.get_matching_blocks()
 
@@ -111,6 +141,7 @@ def process_single_song(task):
                 u_idx = block.b + i
                 user_word_times[u_idx] = whisper_word_objects[w_idx]["start"]
 
+        # Linear Interpolation Fill-in Strategy for Missing/Mumbled Words
         known_indices = [i for i, t in enumerate(user_word_times) if t is not None]
 
         if not known_indices:
@@ -136,6 +167,7 @@ def process_single_song(task):
                     fraction = (i - idx1) / (idx2 - idx1)
                     user_word_times[i] = t1 + fraction * (t2 - t1)
 
+        # Segment Construction
         final_segments = []
         for line_idx in range(len(user_ru)):
             line_word_indices = [i for i, l in enumerate(word_to_line_map) if l == line_idx]
@@ -166,10 +198,20 @@ def process_single_song(task):
 
     except Exception as e:
         import traceback
-        if vocals_path and os.path.exists(vocals_path):
-            os.remove(vocals_path)
         return {"success": False, "title": title, "error": traceback.format_exc()}
-
+        
+    finally:
+        # Guarantee that temporary audio files are deleted to prevent storage leaks
+        if vocals_path and os.path.exists(vocals_path):
+            try:
+                os.remove(vocals_path)
+            except Exception:
+                pass
+        if stripped_wav_path and os.path.exists(stripped_wav_path):
+            try:
+                os.remove(stripped_wav_path)
+            except Exception:
+                pass
 
 class ParallelAIWorker(QThread):
     progress = pyqtSignal(str)          
